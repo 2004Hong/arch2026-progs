@@ -44,8 +44,10 @@ gcd_u32_asm:
     andi    t1, a1, 1
     bnez    t1, .Lorder
 
-    # a1 is even here. Low bits 10 mean exactly one trailing zero;
-    # low bits 00 mean at least two, so use the grouped checks below.
+.Lright_even:
+    # a1 is nonzero and even here.
+    # Low bits 10 mean exactly one trailing zero;
+    # low bits 00 mean at least two trailing zeros.
     andi    t1, a1, 3
     beqz    t1, .Lright_many
     srli    a1, a1, 1
@@ -91,9 +93,10 @@ gcd_u32_asm:
     mv      a1, t2
 
 .Lsubtract:
-    # Subtraction preserves GCD. Continue only for a nonzero difference.
+    # Both operands are odd, so their difference is even.
+    # If nonzero, skip the repeated parity check.
     sub     a1, a1, a0
-    bne     a1, zero, .Lright
+    bne     a1, zero, .Lright_even
 
     # Restore the shared factors of two removed at the beginning.
     sll     a0, a0, t0
