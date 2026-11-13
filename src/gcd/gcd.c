@@ -1,7 +1,12 @@
 #include "gcd.h"
 
+/*
+ * Compute the unsigned 32-bit GCD using the binary GCD algorithm.
+ * Return the other operand for a zero input, including gcd(0, 0) = 0.
+ */
 uint32_t gcd_u32(uint32_t a, uint32_t b)
 {
+    /* Handle zero before the shift loops, which never make zero odd. */
     if (a == 0)
         return b;
 
@@ -10,25 +15,31 @@ uint32_t gcd_u32(uint32_t a, uint32_t b)
 
     unsigned shift = 0;
 
+    /* Remove shared factors of two and count them for later restoration. */
     while (((a | b) & 1U) == 0) {
         a >>= 1;
         b >>= 1;
         ++shift;
     }
 
+    /* At least one operand is odd; remove remaining factors of two from a. */
     while ((a & 1U) == 0)
         a >>= 1;
 
     do {
-        /*本次更新Lright，一次檢查多個零，有連續零出現可以一次右移，不用跑回圈一次一次檢查*/
+        /* a is odd and b is nonzero. An odd b needs no shift. */
         if ((b & 1U) == 0) {
             if ((b & 3U) != 0) {
-                b >>=
-                    1; /*a1如果已經是奇數就不用位移,並檢查第0,1,2位是不是0，是的話就去後面檢查更多位的狀況，不是的話就一位一位移動*/
+                /* Low bits 10 mean exactly one trailing zero. */
+                b >>= 1;
             } else {
+                /*
+                 * At least two trailing zeros remain.
+                 * Remove them in groups of 16, 8, 4, 2, and 1 bits.
+                 * Each check uses the value after any preceding shifts.
+                 */
                 if ((b & 0xFFFFU) == 0)
-                    b >>=
-                        16; /*先檢查前16位是不是都是0，是的話一次移動完，不是的話往下檢查*/
+                    b >>= 16;
                 if ((b & 0xFFU) == 0)
                     b >>= 8;
                 if ((b & 0xFU) == 0)
@@ -39,16 +50,18 @@ uint32_t gcd_u32(uint32_t a, uint32_t b)
                     b >>= 1;
             }
         }
-        /*本次更新Lright，一次檢查多個零，有連續零出現可以一次右移，不用跑回圈一次一次檢查*/
 
+        /* Both operands are odd. Ensure a <= b before subtraction. */
         if (a > b) {
             uint32_t temp = a;
             a = b;
             b = temp;
         }
 
+        /* Subtraction preserves GCD. A zero difference ends the loop. */
         b -= a;
     } while (b != 0);
 
+    /* Restore the shared factors of two removed at the beginning. */
     return a << shift;
 }
