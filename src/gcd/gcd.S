@@ -9,7 +9,7 @@
 # Registers:
 #   a0, a1: current operands
 #   t0: number of shared factors of two
-#   t1: temporary value for parity checks
+#   t1: temporary value for parity and trailing-zero checks
 #   t2: temporary value for swapping operands
 # Leaf function: no stack frame or saved registers are needed.
 gcd_u32_asm:
@@ -40,15 +40,50 @@ gcd_u32_asm:
     j       .Lleft
 
 .Lright:
-    # a0 is odd and a1 is nonzero, so stripping factors of two preserves GCD.
+    # a0 is odd and a1 is nonzero. An odd a1 needs no shift.
     andi    t1, a1, 1
-    bne     t1, zero, .Lorder
+    bnez    t1, .Lorder
 
+    # a1 is even here. Low bits 10 mean exactly one trailing zero;
+    # low bits 00 mean at least two, so use the grouped checks below.
+    andi    t1, a1, 3
+    beqz    t1, .Lright_many
     srli    a1, a1, 1
-    j       .Lright
+    j       .Lorder
+
+.Lright_many:
+    # Remove trailing zeros in groups of 16, 8, 4, 2, and 1 bits.
+    # Shifting a copy left by 16 tests whether the low 16 bits are zero.
+    slli    t1, a1, 16
+    bnez    t1, .Lright8
+    srli    a1, a1, 16
+
+.Lright8:
+    # Test the low 8 bits of the current value.
+    andi    t1, a1, 255
+    bnez    t1, .Lright4
+    srli    a1, a1, 8
+
+.Lright4:
+    # Test the low 4 bits after any earlier shifts.
+    andi    t1, a1, 15
+    bnez    t1, .Lright2
+    srli    a1, a1, 4
+
+.Lright2:
+    # Remove two more factors of two if both low bits are zero.
+    andi    t1, a1, 3
+    bnez    t1, .Lright1
+    srli    a1, a1, 2
+
+.Lright1:
+    # Remove the final factor of two, if present.
+    andi    t1, a1, 1
+    bnez    t1, .Lorder
+    srli    a1, a1, 1
 
 .Lorder:
-    # Use unsigned comparison to ensure a0 <= a1 before subtraction.
+    # Both operands are now odd. Ensure a0 <= a1 before subtraction.
     bgeu    a1, a0, .Lsubtract
 
     mv      t2, a0
@@ -60,7 +95,7 @@ gcd_u32_asm:
     sub     a1, a1, a0
     bne     a1, zero, .Lright
 
-    # a0 holds the reduced GCD; restore the shared factors of two.
+    # Restore the shared factors of two removed at the beginning.
     sll     a0, a0, t0
     ret
 
