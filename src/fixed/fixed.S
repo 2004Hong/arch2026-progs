@@ -9,24 +9,24 @@
 # Temporaries: t0 = carry, t1 = pass count.
 op1_asm:
     li t1,0
-    sw t1,0(a2)
 
-.Lop1_loop:
-    # Stop when no addition or carry remains.
+    # Check once before entering; later iterations test at the bottom.
     beqz a1,.Lop1_done
 
+.Lop1_loop:
     # Separate the carry bits from the sum without carries.
     and t0,a0,a1
     slli t0,t0,1
     xor a0,a0,a1
     mv a1,t0
 
-    # Update the pass count in memory after each iteration.
+    # Keep the count in a register and branch directly to the next pass.
     addi t1,t1,1
-    sw t1,0(a2)
-    j .Lop1_loop
+    bnez a1,.Lop1_loop
 
 .Lop1_done:
+    # Write the count once, including zero when the initial b is zero.
+    sw t1,0(a2)
     ret
     .size op1_asm,.-op1_asm
 
@@ -45,17 +45,13 @@ op2_asm:
 
 # Inputs: a0 = a, a1 = b.
 # Output: a0 = floor of the exact average, without sum overflow.
-# Temporary: t1 = sum of the individually shifted inputs.
-# a1 is overwritten.
+# Temporary: t0 = the differing bits, then their shifted value.
 op3_asm:
-    srli t1,a0,1
+    # Use (a & b) + ((a ^ b) >> 1) to reduce the instruction count.
+    xor t0,a0,a1
     and a0,a0,a1
-    srli a1,a1,1
-    add t1,t1,a1
-
-    # Two odd inputs each lose 0.5 when shifted, so restore one.
-    andi a0,a0,1
-    add a0,t1,a0
+    srli t0,t0,1
+    add a0,a0,t0
     ret
     .size op3_asm,.-op3_asm
 
