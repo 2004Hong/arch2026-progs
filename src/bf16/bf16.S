@@ -1,5 +1,5 @@
-# Second optimization of the BF16 assembly.
-# Reduce square-root saves, remove redundant checks, and unroll eight steps.
+# Third optimization of the BF16 assembly.
+# Remove the square-root stack frame and simplify its first step.
     .text
     .align 2
     .globl bf16_from_f32_asm
@@ -7,7 +7,7 @@
 
 # Input: a0 = FP32 bit pattern. Output: a0 = BF16 bit pattern.
 bf16_from_f32_asm:
-    # Mask FP32 exponent bits 23-30 directly with 0x7F800000.
+    # Mask FP32 exponent bits 23-30 with 0x7F800000.
     lui t1,0x7f800
     and t0,a0,t1
     beq t0,t1,.Lf32_shift
@@ -30,8 +30,8 @@ bf16_from_f32_asm:
 # s0/s1: original operands; s2: result sign.
 # s3/s4: effective exponents; s5/s6: integer significands.
 bf16_mul_asm:
-    # No saved ra is needed because multiplication is performed locally.
-    # Keep the stack aligned to 16 bytes.
+    # Preserve used saved registers with 16-byte stack alignment.
+    # No saved ra is needed because this function makes no calls.
     addi sp,sp,-32
     sw s0,24(sp)
     sw s1,20(sp)
@@ -104,7 +104,7 @@ bf16_mul_asm:
     srli a1,a1,1
     bnez a1,.Lmul_accumulate
 
-    # The product fits in 16 bits; shifting by 15 tests its top bit.
+    # The product fits in 16 bits; bit 15 selects the scaling shift.
     srli t0,a0,15
     beqz t0,.Lmul_shift7
     srli a0,a0,8
@@ -177,14 +177,9 @@ bf16_mul_asm:
     .type bf16_sqrt_asm,@function
 
 # Input: a0 = BF16 operand. Output: a0 = BF16 square root.
-# s0: adjusted significand; s1: result exponent field; s4: root.
+# a1: adjusted significand; a2: result exponent field; a3: root.
+# Only caller-saved registers are used, so no stack frame is needed.
 bf16_sqrt_asm:
-    # Save only the callee-saved registers used by this leaf function.
-    addi sp,sp,-16
-    sw s0,8(sp)
-    sw s1,4(sp)
-    sw s4,0(sp)
-
     srli t0,a0,15
     srli t1,a0,7
     andi t1,t1,255
@@ -200,33 +195,28 @@ bf16_sqrt_asm:
 
     # Restore the leading one and make the actual exponent even.
     addi t1,t1,-127
-    ori s0,t2,128
+    ori a1,t2,128
     andi t3,t1,1
     beqz t3,.Lsqrt_halve
-    slli s0,s0,1
+    slli a1,a1,1
     addi t1,t1,-1
 
 .Lsqrt_halve:
-    srai s1,t1,1
-    addi s1,s1,127
+    srai a2,t1,1
+    addi a2,a2,127
 
-    # Integer square-root target: 128*m + 127.
-    # Preserve the original floor(q*q / 128) <= m condition.
-    slli t0,s0,7
+    # Preserve the original search condition using target 128*m + 127.
+    slli t0,a1,7
     addi t0,t0,127
     li t1,0
 
-    # Unroll the eight steps to remove loop updates and backward jumps.
+    # The target is at least 16511, so accepting 128 always succeeds.
+    # Set the accumulator and subtract 128 squared without a comparison.
+    li t1,16384
+    sub t0,t0,t1
+
+    # Remaining steps are unrolled.
     # t0: remainder; t1: scaled root accumulator; t3: trial increase.
-
-    # Try adding 128: candidate squared = 16384.
-    li t2,16384
-    add t3,t1,t2
-    srli t1,t1,1
-    bltu t0,t3,.Lsqrt_step64
-    sub t0,t0,t3
-    or t1,t1,t2
-
 .Lsqrt_step64:
     # Try adding 64: candidate squared = 4096.
     li t2,4096
@@ -237,7 +227,7 @@ bf16_sqrt_asm:
     or t1,t1,t2
 
 .Lsqrt_step32:
-    # Smaller squared candidates fit directly in immediate instructions.
+    # Smaller squared candidates fit in immediate instructions.
     addi t3,t1,1024
     srli t1,t1,1
     bltu t0,t3,.Lsqrt_step16
@@ -281,14 +271,15 @@ bf16_sqrt_asm:
 
 .Lsqrt_digits_done:
     # The root is in [128,255] and the exponent field is in [64,190].
-    # No normalization or exponent-range checks are needed here.
-    mv s4,t1
-    slli a0,s1,7
-    andi t0,s4,127
+    # Pack the result directly without normalization or range checks.
+    mv a3,t1
+    slli a0,a2,7
+    andi t0,a3,127
     or a0,a0,t0
     j .Lsqrt_return
 
 .Lsqrt_special:
+    # Preserve NaNs and positive infinity; negative infinity becomes NaN.
     bnez t2,.Lsqrt_return
     bnez t0,.Lsqrt_nan
     j .Lsqrt_return
@@ -302,10 +293,6 @@ bf16_sqrt_asm:
     li a0,0
 
 .Lsqrt_return:
-    lw s0,8(sp)
-    lw s1,4(sp)
-    lw s4,0(sp)
-    addi sp,sp,16
     ret
     .size bf16_sqrt_asm,.-bf16_sqrt_asm
 
