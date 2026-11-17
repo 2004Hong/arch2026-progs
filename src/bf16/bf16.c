@@ -1,5 +1,4 @@
 #include "bf16.h"
-
 typedef struct {
     uint16_t bits;
 } bf16_t;
@@ -8,7 +7,7 @@ typedef struct {
 #define BF16_NAN() ((bf16_t) {.bits = 0x7FC0U})
 #define BF16_ZERO() ((bf16_t) {.bits = 0x0000U})
 
-/* Receive the FP32 bit pattern without using floating-point arithmetic. */
+/* Receive the FP32 bit pattern without floating-point arithmetic. */
 uint16_t bf16_from_f32(uint32_t f32bits)
 {
     /* For infinity and NaN, keep the upper 16 bits unchanged. */
@@ -31,7 +30,7 @@ static bf16_t multiply_value(bf16_t a, bf16_t b)
 
     uint16_t result_sign = sign_a ^ sign_b;
 
-    /* Preserve operand order: an infinite a takes precedence over a NaN b. */
+    /* Preserve operand order: infinite a takes precedence over NaN b. */
     if (exp_a == 0xFF) {
         if (mant_a)
             return a;
@@ -49,8 +48,8 @@ static bf16_t multiply_value(bf16_t a, bf16_t b)
     if ((!exp_a && !mant_a) || (!exp_b && !mant_b))
         return (bf16_t) {.bits = result_sign << 15};
 
-    /* Restore the implicit leading one for normal operands.
-     * Normalize subnormal operands and record the exponent adjustment.
+    /* Restore the leading one for normal operands.
+     * Normalize subnormals and record their exponent adjustment.
      */
     int16_t exp_adjust = 0;
     if (!exp_a) {
@@ -70,12 +69,11 @@ static bf16_t multiply_value(bf16_t a, bf16_t b)
     } else
         mant_b |= 0x80;
 
-    /* Multiply the integer significands and combine their exponents. */
     uint32_t result_mant = (uint32_t) mant_a * mant_b;
     int32_t result_exp = (int32_t) exp_a + exp_b - BF16_EXP_BIAS + exp_adjust;
 
-    /* Truncate to eight significant bits, then remove the leading one.
-     * A product with bit 15 set needs an extra shift and exponent increment.
+    /* Truncate the product and remove the implicit leading one.
+     * Bit 15 requires an extra shift and exponent increment.
      */
     if (result_mant & 0x8000) {
         result_mant = (result_mant >> 8) & 0x7F;
@@ -86,8 +84,8 @@ static bf16_t multiply_value(bf16_t a, bf16_t b)
     if (result_exp >= 0xFF)
         return (bf16_t) {.bits = (result_sign << 15) | 0x7F80};
 
-    /* Preserve the contract's underflow behavior: shift the fraction
-     * after removing the implicit one, or return signed zero.
+    /* Preserve the contract's underflow behavior:
+     * shift the fraction after removing the implicit leading one.
      */
     if (result_exp <= 0) {
         if (result_exp < -6)
@@ -103,7 +101,7 @@ static bf16_t multiply_value(bf16_t a, bf16_t b)
 static bf16_t square_root_value(bf16_t a)
 {
     uint16_t sign = (a.bits >> 15) & 1;
-    int16_t exp = ((a.bits >> 7) & 0xFF);
+    int16_t exp = (a.bits >> 7) & 0xFF;
     uint16_t mant = a.bits & 0x7F;
 
     /* Preserve NaNs and positive infinity; negative infinity becomes NaN. */
@@ -128,7 +126,7 @@ static bf16_t square_root_value(bf16_t a)
 
     int32_t e = exp - BF16_EXP_BIAS;
     int32_t new_exp;
-    uint32_t m = 0x80 | mant;
+    uint32_t m = 0x80U | mant;
 
     /* Make the exponent even while preserving the input value,
      * then halve it and restore the bias.
@@ -140,23 +138,28 @@ static bf16_t square_root_value(bf16_t a)
         new_exp = (e >> 1) + BF16_EXP_BIAS;
     }
 
-    uint32_t low = 90;
-    uint32_t high = 256;
-    uint32_t result = 128;
-
-    /* Find the largest integer q satisfying floor(q*q / 128) <= m.
-     * This is floor(sqrt(128*m + 127)), not floor(sqrt(128*m)).
+    /* Preserve floor(q*q / 128) <= m from the original search.
+     * Its largest solution is floor(sqrt(128*m + 127)).
      */
-    while (low <= high) {
-        uint32_t mid = (low + high) >> 1;
-        uint32_t sq = (mid * mid) / 128;
+    uint32_t remainder = (m << 7) + 127U;
+    uint32_t result = 0;
+    uint32_t bit = 0x4000U; /* Start with 128 squared. */
 
-        if (sq <= m) {
-            result = mid;
-            low = mid + 1;
-        } else {
-            high = mid - 1;
+    /* Build the root from high bits to low bits without multiplication.
+     * result holds a scaled intermediate value until the final step.
+     */
+    while (bit != 0) {
+        uint32_t trial = result + bit;
+        result >>= 1;
+
+        /* Accept this root bit if the remainder covers the increase. */
+        if (remainder >= trial) {
+            remainder -= trial;
+            result |= bit;
         }
+
+        /* Halving the candidate root bit divides its square by four. */
+        bit >>= 2;
     }
 
     /* Retain the original normalization and exponent-range checks. */
@@ -175,6 +178,7 @@ static bf16_t square_root_value(bf16_t a)
 
     if (new_exp >= 0xFF)
         return (bf16_t) {.bits = 0x7F80};
+
     if (new_exp <= 0)
         return BF16_ZERO();
 

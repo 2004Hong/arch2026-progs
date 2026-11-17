@@ -1,3 +1,5 @@
+# First optimization of the baseline BF16 assembly.
+# Inline shift-and-add multiplication and use a digit-by-digit square root.
     .text
     .align 2
     .globl bf16_from_f32_asm
@@ -5,13 +7,12 @@
 
 # Input: a0 = FP32 bit pattern. Output: a0 = BF16 bit pattern.
 bf16_from_f32_asm:
-    # For infinity and NaN, keep the upper 16 bits unchanged.
-    srli t0,a0,23
-    andi t0,t0,255
-    li t1,255
+    # Mask FP32 exponent bits 23-30 directly with 0x7F800000.
+    lui t1,0x7f800
+    and t0,a0,t1
     beq t0,t1,.Lf32_shift
 
-    # Round to nearest; ties select an even retained low bit.
+    # Round to nearest, with ties to an even retained low bit.
     srli t0,a0,16
     andi t0,t0,1
     li t1,0x7fff
@@ -29,9 +30,9 @@ bf16_from_f32_asm:
 # s0/s1: original operands; s2: result sign.
 # s3/s4: effective exponents; s5/s6: integer significands.
 bf16_mul_asm:
-    # Preserve callee-saved registers and ra across __mulsi3.
+    # This leaf function needs no saved ra.
+    # Keep a 32-byte frame to preserve 16-byte stack alignment.
     addi sp,sp,-32
-    sw ra,28(sp)
     sw s0,24(sp)
     sw s1,20(sp)
     sw s2,16(sp)
@@ -52,7 +53,7 @@ bf16_mul_asm:
     andi s5,a0,127
     andi s6,a1,127
 
-    # Check special operands before handling finite zeros.
+    # Handle special operands before finite zeros.
     li t0,255
     beq s3,t0,.Lmul_special_a
     beq s4,t0,.Lmul_special_b
@@ -61,8 +62,8 @@ bf16_mul_asm:
     or t0,s4,s6
     beqz t0,.Lmul_zero
 
-    # Normalize subnormals by shifting and reducing the exponent.
-    # Normal operands only need their implicit leading one restored.
+    # Normalize subnormals and adjust their effective exponents.
+    # Normal operands only need the implicit leading one restored.
     bnez s3,.Lmul_normal_a
     li s3,1
 .Lmul_normalize_a:
@@ -87,17 +88,25 @@ bf16_mul_asm:
     ori s6,s6,128
 
 .Lmul_product:
-    # Combine exponents and multiply the eight-bit significands.
     add s3,s3,s4
     addi s3,s3,-127
-    mv a0,s5
-    mv a1,s6
-    call __mulsi3
 
-    # Truncate the product and remove the implicit leading one.
-    # Bit 15 requires an extra shift and exponent increment.
-    li t0,0x8000
-    and t0,a0,t0
+    # Multiply the significands locally instead of calling __mulsi3.
+    # Each is nonzero, so the loop can test termination at the bottom.
+    mv t1,s5
+    mv a1,s6
+    li a0,0
+.Lmul_accumulate:
+    andi t0,a1,1
+    beqz t0,.Lmul_advance
+    add a0,a0,t1
+.Lmul_advance:
+    slli t1,t1,1
+    srli a1,a1,1
+    bnez a1,.Lmul_accumulate
+
+    # The product fits in 16 bits; shifting by 15 tests its top bit.
+    srli t0,a0,15
     beqz t0,.Lmul_shift7
     srli a0,a0,8
     andi a0,a0,127
@@ -112,8 +121,7 @@ bf16_mul_asm:
     bge s3,t0,.Lmul_inf
     bgtz s3,.Lmul_pack
 
-    # Preserve the contract's underflow behavior.
-    # Shift the fraction after removing the implicit leading one.
+    # Preserve the contract's fraction-only underflow adjustment.
     li t0,-6
     blt s3,t0,.Lmul_zero
     li t0,1
@@ -122,7 +130,6 @@ bf16_mul_asm:
     li s3,0
 
 .Lmul_pack:
-    # Combine sign, exponent and fraction into the BF16 encoding.
     slli t0,s3,7
     or a0,a0,t0
     or a0,a0,s2
@@ -163,7 +170,6 @@ bf16_mul_asm:
     lw s2,16(sp)
     lw s1,20(sp)
     lw s0,24(sp)
-    lw ra,28(sp)
     addi sp,sp,32
     ret
     .size bf16_mul_asm,.-bf16_mul_asm
@@ -172,10 +178,9 @@ bf16_mul_asm:
     .type bf16_sqrt_asm,@function
 
 # Input: a0 = BF16 operand. Output: a0 = BF16 square root.
-# s0: adjusted significand; s1: result exponent field.
-# s2/s3: search bounds; s4: accepted result; s5: midpoint.
+# s0: adjusted significand; s1: result exponent field; s4: root.
 bf16_sqrt_asm:
-    # Keep search values across calls to __mulsi3.
+    # Retain the baseline register-saving layout in this version.
     addi sp,sp,-32
     sw ra,28(sp)
     sw s0,24(sp)
@@ -190,21 +195,17 @@ bf16_sqrt_asm:
     andi t1,t1,255
     andi t2,a0,127
 
-    # Handle NaNs and infinities before inspecting the sign.
+    # Preserve special-value behavior, including sqrt(-0) = +0.
     li t3,255
     beq t1,t3,.Lsqrt_special
     or t3,t1,t2
     beqz t3,.Lsqrt_zero
     bnez t0,.Lsqrt_nan
-
-    # All positive subnormal inputs become positive zero.
     beqz t1,.Lsqrt_zero
 
-    # Remove the bias and restore the implicit leading one.
+    # Restore the leading one and make the actual exponent even.
     addi t1,t1,-127
     ori s0,t2,128
-
-    # Make the exponent even without changing the input value.
     andi t3,t1,1
     beqz t3,.Lsqrt_halve
     slli s0,s0,1
@@ -213,30 +214,35 @@ bf16_sqrt_asm:
 .Lsqrt_halve:
     srai s1,t1,1
     addi s1,s1,127
-    li s2,90
-    li s3,256
-    li s4,128
 
-.Lsqrt_search:
-    # Find the largest q satisfying floor(q*q / 128) <= s0.
-    bltu s3,s2,.Lsqrt_normalize
-    add s5,s2,s3
-    srli s5,s5,1
-    mv a0,s5
-    mv a1,s5
-    call __mulsi3
-    srli a0,a0,7
+    # Preserve the original condition floor(q*q / 128) <= m.
+    # Compute the integer square root of 128*m + 127.
+    slli t0,s0,7
+    addi t0,t0,127
 
-    bltu s0,a0,.Lsqrt_high
-    mv s4,s5
-    addi s2,s5,1
-    j .Lsqrt_search
-.Lsqrt_high:
-    addi s3,s5,-1
-    j .Lsqrt_search
+    # t0: remainder; t1: scaled root accumulator; t2: candidate squared.
+    li t1,0
+    li t2,0x4000
+
+.Lsqrt_digit_loop:
+    # At entry, t1 = 2*x*d and t2 = d*d.
+    # trial is the increase from x*x to (x+d)*(x+d).
+    add t3,t1,t2
+    srli t1,t1,1
+    bltu t0,t3,.Lsqrt_digit_next
+
+    # Accept this root bit and prepare the accumulator for the next step.
+    sub t0,t0,t3
+    or t1,t1,t2
+
+.Lsqrt_digit_next:
+    # Halving d divides d*d by four: 128^2, 64^2, ..., 1^2.
+    srli t2,t2,2
+    bnez t2,.Lsqrt_digit_loop
+    mv s4,t1
 
 .Lsqrt_normalize:
-    # Retain the original normalization and exponent-range checks.
+    # Retain the baseline normalization and exponent-range checks.
     li t0,256
     bltu s4,t0,.Lsqrt_check_low
     srli s4,s4,1
@@ -256,14 +262,13 @@ bf16_sqrt_asm:
     bge s1,t0,.Lsqrt_inf
     blez s1,.Lsqrt_zero
 
-    # Store the exponent and seven fraction bits.
+    # Combine the exponent and seven fraction bits.
     slli a0,s1,7
     andi t0,s4,127
     or a0,a0,t0
     j .Lsqrt_return
 
 .Lsqrt_special:
-    # Preserve NaNs and positive infinity; negative infinity becomes NaN.
     bnez t2,.Lsqrt_return
     bnez t0,.Lsqrt_nan
     j .Lsqrt_return
@@ -274,7 +279,6 @@ bf16_sqrt_asm:
     li a0,0x7fc0
     j .Lsqrt_return
 .Lsqrt_zero:
-    # Return positive zero for both signed zeros and positive subnormals.
     li a0,0
 
 .Lsqrt_return:
