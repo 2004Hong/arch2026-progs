@@ -4,9 +4,9 @@
 #include "rubik_tables.h"
 
 /* Use precomputed transition and distance tables.
- * Try the five-move table for the input state before falling back to IDA*.
+ * Complete search suffixes through the five-move table whenever
+ * the remaining depth budget is at most five.
  */
-
 enum {
     CUBIES = 7,
     PERMUTATIONS = 5040,
@@ -58,6 +58,13 @@ static uint8_t heuristic(uint16_t p, uint16_t o)
     return hp > ho ? hp : ho;
 }
 
+/* Declare the table solver before it is used by the search. */
+static int solve_five_step(uint16_t p,
+                           uint16_t o,
+                           unsigned remaining,
+                           uint8_t *path,
+                           unsigned *length);
+
 static int search_with_limit(uint16_t start_p,
                              uint16_t start_o,
                              unsigned limit,
@@ -87,6 +94,27 @@ static int search_with_limit(uint16_t start_p,
             depth + heuristic(p_states[depth], o_states[depth]) > limit) {
             if (depth == 0)
                 return 0;
+            --depth;
+            continue;
+        }
+
+        /* Use the table instead of expanding the final five search levels. */
+        unsigned remaining = limit - depth;
+
+        if (remaining <= 5) {
+            unsigned suffix_length = 0;
+
+            if (solve_five_step(p_states[depth], o_states[depth], remaining,
+                                path + depth, &suffix_length)) {
+                /* Append the table solution after the searched prefix. */
+                *length = depth + suffix_length;
+                return 1;
+            }
+
+            /* No solution fits the remaining budget; backtrack immediately. */
+            if (depth == 0)
+                return 0;
+
             --depth;
             continue;
         }
@@ -178,21 +206,20 @@ static int find_five_step(uint32_t rank)
     return -1;
 }
 
-
-/* Follow the recorded moves toward solved, using at most five moves. */
-static int solve_five_step(const state_t *state,
-                           uint8_t path[MAX_DEPTH],
+/* Follow table moves from the supplied coordinates within the given budget. */
+static int solve_five_step(uint16_t p,
+                           uint16_t o,
+                           unsigned remaining,
+                           uint8_t *path,
                            unsigned *length)
 {
-    uint32_t rank = rank_state(state);
-    uint16_t p = (uint16_t) (rank / ORIENTATIONS);
-    uint16_t o = (uint16_t) (rank % ORIENTATIONS);
     unsigned steps = 0;
 
     while (p != 0 || o != 0) {
         int index = find_five_step((uint32_t) p * ORIENTATIONS + o);
 
-        if (index < 0 || steps >= 5)
+        /* Reject missing states or paths exceeding either move limit. */
+        if (index < 0 || steps >= 5 || steps >= remaining)
             return 0;
 
         uint8_t move = five_step_next_move[index];
@@ -235,8 +262,9 @@ int rubik_solve(const char *input, char *out, size_t cap)
         return 0;
     }
 
-    /* Try the five-move table first; use IDA* if it cannot solve the input. */
-    if (!solve_five_step(&state, path, &length) &&
+    /* Try a direct five-move solution before starting IDA* search. */
+    if (!solve_five_step((uint16_t) (rank / ORIENTATIONS),
+                         (uint16_t) (rank % ORIENTATIONS), 5, path, &length) &&
         !solve_ida(&state, MAX_DEPTH, path, &length, &stats, 0))
         return -1;
     size_t need = 1;
