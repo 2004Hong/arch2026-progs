@@ -1,9 +1,6 @@
-# Baseline hand-written RV32I IDA* solver.
-# Use precomputed transition and distance tables stored in this file.
-# Track permutation and orientation separately during the search.
-
-
-
+# First optimization of the hand-written RV32I Rubik solver.
+# Keep the baseline IDA* search and finish suffixes with a five-move table.
+# Transition tables and five-move tables are stored as static data.
 .data
 
 move_R:  .asciz "R"
@@ -1511,7 +1508,6 @@ orientation_next_D:
     .globl rubik_solve_asm
     .type rubik_solve_asm,@function
 
-
 # Inputs: a0 = state string, a1 = output buffer, a2 = buffer capacity.
 # Return the solution length, -1 for invalid input, or -2 for insufficient space.
 rubik_solve_asm:
@@ -1892,6 +1888,44 @@ search_loop:
     bltu s1, t0, search_backtrack
 
 
+
+
+
+    # Complete the suffix through the table when at most five moves remain.
+    sub a2,s1,s0
+    li t0,5
+    bltu t0,a2,.Lsearch_expand
+
+
+    # Reload current coordinates after the heuristic call.
+    slli t0,s0,1
+    add t1,s2,t0
+    lhu a0,0(t1)
+    add t1,s3,t0
+    lhu a1,0(t1)
+
+
+    # Write table moves after the existing path prefix.
+    add a3,s5,s0
+    call five_step_finish_asm
+
+
+    # A missing or over-budget suffix cannot satisfy this search limit.
+    beqz a0,search_backtrack
+
+
+    # Combine the searched prefix length and the table suffix length.
+    add a1,a1,s0
+    li a0,1
+    j search_return
+
+# More than five moves remain; continue the original IDA* expansion.
+.Lsearch_expand:
+
+
+
+
+
     add t0, s4, s0
     lbu t4, 0(t0)
     addi t1, t4, 1
@@ -2074,3 +2108,165 @@ solve_return:
 
 
     .section .note.GNU-stack,"",@progbits
+
+    # Include the generated read-only five-move tables.
+    .include "src/rubik/rubik_five_step.inc"
+
+
+    .text
+    .align 2
+    .type five_step_find_asm, @function
+
+
+
+
+# Binary-search sorted full-state ranks; return the index or -1 in a0.
+# Uses only temporary registers and returns immediately on equality.
+five_step_find_asm:
+    li t0,0
+    li t1,RUBIK_FIVE_STEP_COUNT_ASM
+    la t5,five_step_ranks_asm
+
+.Lfive_find_loop:
+    bgeu t0,t1,.Lfive_find_missing
+
+    add t2,t0,t1
+    srli t2,t2,1
+
+    slli t3,t2,2
+    add t3,t5,t3
+    lw t4,0(t3)
+
+    bltu t4,a0,.Lfive_find_right
+    bltu a0,t4,.Lfive_find_left
+
+    mv a0,t2
+    ret
+
+.Lfive_find_right:
+    addi t0,t2,1
+    j .Lfive_find_loop
+
+.Lfive_find_left:
+    mv t1,t2
+    j .Lfive_find_loop
+
+.Lfive_find_missing:
+    li a0,-1
+    ret
+
+    .size five_step_find_asm,.-five_step_find_asm
+
+
+
+
+
+
+
+
+    .text
+    .align 2
+    .type five_step_finish_asm, @function
+
+
+
+
+
+
+
+
+
+
+
+
+# Inputs: a0 = p, a1 = o, a2 = remaining budget, a3 = suffix destination.
+# Return a0 = success and a1 = suffix length, or both zero on failure.
+# Preserve ra and s0-s4 across the lookup and transition helper calls.
+five_step_finish_asm:
+    addi sp,sp,-32
+    sw ra,28(sp)
+    sw s0,24(sp)
+    sw s1,20(sp)
+    sw s2,16(sp)
+    sw s3,12(sp)
+    sw s4,8(sp)
+
+    mv s0,a0
+    mv s1,a1
+    mv s2,a2
+    mv s3,a3
+    li s4,0
+
+# Follow table moves until solved, rejecting paths that exceed the budget.
+.Lfive_finish_loop:
+
+    or t0,s0,s1
+    beqz t0,.Lfive_finish_success
+
+
+    bgeu s4,s2,.Lfive_finish_fail
+    li t0,5
+    bgeu s4,t0,.Lfive_finish_fail
+
+
+
+    # Form p*729+o using 729 = 9*(64+16+1), without multiplication.
+    slli t0,s0,3
+    add t0,t0,s0
+    slli t1,t0,6
+    slli a0,t0,4
+    add a0,a0,t1
+    add a0,a0,t0
+    add a0,a0,s1
+
+    # Look up the full-state rank and reject absent states.
+    call five_step_find_asm
+    bltz a0,.Lfive_finish_fail
+
+
+    # Read and validate the recorded move toward the solved state.
+    la t0,five_step_next_move_asm
+    add t0,t0,a0
+    lbu a2,0(t0)
+
+
+    li t1,9
+    bgeu a2,t1,.Lfive_finish_fail
+
+
+    # Append the move to the suffix path.
+    add t0,s3,s4
+    sb a2,0(t0)
+    addi s4,s4,1
+
+
+    mv a0,s0
+    mv a1,s1
+    # Apply the move to both coordinates before the next lookup.
+    call apply_move_indices
+    mv s0,a0
+    mv s1,a1
+
+    j .Lfive_finish_loop
+
+.Lfive_finish_success:
+    mv a1,s4
+    li a0,1
+    j .Lfive_finish_return
+
+.Lfive_finish_fail:
+    li a0,0
+    li a1,0
+
+.Lfive_finish_return:
+    lw s4,8(sp)
+    lw s3,12(sp)
+    lw s2,16(sp)
+    lw s1,20(sp)
+    lw s0,24(sp)
+    lw ra,28(sp)
+    addi sp,sp,32
+    ret
+
+    .size five_step_finish_asm,.-five_step_finish_asm
+
