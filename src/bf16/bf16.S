@@ -1,5 +1,5 @@
-# First optimization of the baseline BF16 assembly.
-# Inline shift-and-add multiplication and use a digit-by-digit square root.
+# Second optimization of the BF16 assembly.
+# Reduce square-root saves, remove redundant checks, and unroll eight steps.
     .text
     .align 2
     .globl bf16_from_f32_asm
@@ -30,8 +30,8 @@ bf16_from_f32_asm:
 # s0/s1: original operands; s2: result sign.
 # s3/s4: effective exponents; s5/s6: integer significands.
 bf16_mul_asm:
-    # This leaf function needs no saved ra.
-    # Keep a 32-byte frame to preserve 16-byte stack alignment.
+    # No saved ra is needed because multiplication is performed locally.
+    # Keep the stack aligned to 16 bytes.
     addi sp,sp,-32
     sw s0,24(sp)
     sw s1,20(sp)
@@ -91,8 +91,7 @@ bf16_mul_asm:
     add s3,s3,s4
     addi s3,s3,-127
 
-    # Multiply the significands locally instead of calling __mulsi3.
-    # Each is nonzero, so the loop can test termination at the bottom.
+    # Multiply the nonzero significands using a bottom-tested loop.
     mv t1,s5
     mv a1,s6
     li a0,0
@@ -180,22 +179,18 @@ bf16_mul_asm:
 # Input: a0 = BF16 operand. Output: a0 = BF16 square root.
 # s0: adjusted significand; s1: result exponent field; s4: root.
 bf16_sqrt_asm:
-    # Retain the baseline register-saving layout in this version.
-    addi sp,sp,-32
-    sw ra,28(sp)
-    sw s0,24(sp)
-    sw s1,20(sp)
-    sw s2,16(sp)
-    sw s3,12(sp)
-    sw s4,8(sp)
-    sw s5,4(sp)
+    # Save only the callee-saved registers used by this leaf function.
+    addi sp,sp,-16
+    sw s0,8(sp)
+    sw s1,4(sp)
+    sw s4,0(sp)
 
     srli t0,a0,15
     srli t1,a0,7
     andi t1,t1,255
     andi t2,a0,127
 
-    # Preserve special-value behavior, including sqrt(-0) = +0.
+    # Preserve special values, negative-input handling, and zero flushing.
     li t3,255
     beq t1,t3,.Lsqrt_special
     or t3,t1,t2
@@ -215,54 +210,79 @@ bf16_sqrt_asm:
     srai s1,t1,1
     addi s1,s1,127
 
-    # Preserve the original condition floor(q*q / 128) <= m.
-    # Compute the integer square root of 128*m + 127.
+    # Integer square-root target: 128*m + 127.
+    # Preserve the original floor(q*q / 128) <= m condition.
     slli t0,s0,7
     addi t0,t0,127
-
-    # t0: remainder; t1: scaled root accumulator; t2: candidate squared.
     li t1,0
-    li t2,0x4000
 
-.Lsqrt_digit_loop:
-    # At entry, t1 = 2*x*d and t2 = d*d.
-    # trial is the increase from x*x to (x+d)*(x+d).
+    # Unroll the eight steps to remove loop updates and backward jumps.
+    # t0: remainder; t1: scaled root accumulator; t3: trial increase.
+
+    # Try adding 128: candidate squared = 16384.
+    li t2,16384
     add t3,t1,t2
     srli t1,t1,1
-    bltu t0,t3,.Lsqrt_digit_next
-
-    # Accept this root bit and prepare the accumulator for the next step.
+    bltu t0,t3,.Lsqrt_step64
     sub t0,t0,t3
     or t1,t1,t2
 
-.Lsqrt_digit_next:
-    # Halving d divides d*d by four: 128^2, 64^2, ..., 1^2.
-    srli t2,t2,2
-    bnez t2,.Lsqrt_digit_loop
+.Lsqrt_step64:
+    # Try adding 64: candidate squared = 4096.
+    li t2,4096
+    add t3,t1,t2
+    srli t1,t1,1
+    bltu t0,t3,.Lsqrt_step32
+    sub t0,t0,t3
+    or t1,t1,t2
+
+.Lsqrt_step32:
+    # Smaller squared candidates fit directly in immediate instructions.
+    addi t3,t1,1024
+    srli t1,t1,1
+    bltu t0,t3,.Lsqrt_step16
+    sub t0,t0,t3
+    ori t1,t1,1024
+
+.Lsqrt_step16:
+    addi t3,t1,256
+    srli t1,t1,1
+    bltu t0,t3,.Lsqrt_step8
+    sub t0,t0,t3
+    ori t1,t1,256
+
+.Lsqrt_step8:
+    addi t3,t1,64
+    srli t1,t1,1
+    bltu t0,t3,.Lsqrt_step4
+    sub t0,t0,t3
+    ori t1,t1,64
+
+.Lsqrt_step4:
+    addi t3,t1,16
+    srli t1,t1,1
+    bltu t0,t3,.Lsqrt_step2
+    sub t0,t0,t3
+    ori t1,t1,16
+
+.Lsqrt_step2:
+    addi t3,t1,4
+    srli t1,t1,1
+    bltu t0,t3,.Lsqrt_step1
+    sub t0,t0,t3
+    ori t1,t1,4
+
+.Lsqrt_step1:
+    addi t3,t1,1
+    srli t1,t1,1
+    bltu t0,t3,.Lsqrt_digits_done
+    sub t0,t0,t3
+    ori t1,t1,1
+
+.Lsqrt_digits_done:
+    # The root is in [128,255] and the exponent field is in [64,190].
+    # No normalization or exponent-range checks are needed here.
     mv s4,t1
-
-.Lsqrt_normalize:
-    # Retain the baseline normalization and exponent-range checks.
-    li t0,256
-    bltu s4,t0,.Lsqrt_check_low
-    srli s4,s4,1
-    addi s1,s1,1
-    j .Lsqrt_range
-.Lsqrt_check_low:
-    li t0,128
-    bgeu s4,t0,.Lsqrt_range
-    li t1,1
-    bge t1,s1,.Lsqrt_range
-    slli s4,s4,1
-    addi s1,s1,-1
-    j .Lsqrt_check_low
-
-.Lsqrt_range:
-    li t0,255
-    bge s1,t0,.Lsqrt_inf
-    blez s1,.Lsqrt_zero
-
-    # Combine the exponent and seven fraction bits.
     slli a0,s1,7
     andi t0,s4,127
     or a0,a0,t0
@@ -282,14 +302,10 @@ bf16_sqrt_asm:
     li a0,0
 
 .Lsqrt_return:
-    lw s5,4(sp)
-    lw s4,8(sp)
-    lw s3,12(sp)
-    lw s2,16(sp)
-    lw s1,20(sp)
-    lw s0,24(sp)
-    lw ra,28(sp)
-    addi sp,sp,32
+    lw s0,8(sp)
+    lw s1,4(sp)
+    lw s4,0(sp)
+    addi sp,sp,16
     ret
     .size bf16_sqrt_asm,.-bf16_sqrt_asm
 
